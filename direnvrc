@@ -1,0 +1,325 @@
+# SPDX-License-Identifier: MIT
+# direnv recursive loader: load every ancestor .envrc, with full security checks.
+#
+# Installed as ~/.config/direnv/direnvrc by the setup recipe in this repo's
+# justfile. direnv loads this file before every .envrc evaluation; the code
+# below walks $PWD upward and sources each ancestor .envrc that direnv would
+# have allowed on its own.
+#
+# Without this, direnv loads only the nearest .envrc, and per-child source_up
+# is the documented escape hatch (see issue #190). The trick of putting
+# source_up_if_exists in direnvrc loads only one level — direnvrc isn't
+# re-entered when source_env nests, so the chain has to be walked explicitly.
+#
+# Security model — mirrors direnv/internal/cmd/rc.go's Allowed() exactly:
+#   1. Deny database hit                        -> never load
+#   2. Allow database hit (content hash match)  -> load
+#   3. direnv.toml [whitelist].exact match      -> load
+#   4. direnv.toml [whitelist].prefix match     -> load
+#   5. otherwise                                -> skip (fail-closed)
+# Each ancestor must be authorized on its own merits — this loader does not
+# elevate trust. Children that previously relied on `source_up` are not
+# silently auto-trusted; they're checked the same as any other .envrc.
+#
+# Hash format (verified against direnv 2.x source, internal/cmd/rc.go):
+#   allow: sha256( filepath.Abs(path) + "\n" + file_contents )
+#   deny:  sha256( filepath.Abs(path) + "\n" )
+# Stored at $XDG_DATA_HOME/direnv/{allow,deny}/<hex_digest>.
+#
+# Inspired by md2k's snippet on direnv issue #190
+#   https://github.com/direnv/direnv/issues/190#issuecomment-3286617153
+# Reimplemented from direnv-stdlib(1), direnv.toml(1), and direnv's Go source.
+#
+# Configuration (env, set before direnv evaluates):
+#   DIRENV_RECURSIVE_DEPTH     bound the walk by parent count.
+#                                unset/empty/0  -> off (loader is inert; default)
+#                                N (positive)   -> walk at most N parents above $PWD
+#                              Non-numeric values fail closed (treated as 0).
+#                              Ships off by default — users opt in via shell rc.
+#   DIRENV_RECURSIVE_QUIET     if non-empty, suppress per-file load/skip lines.
+#
+# First run: in a tree of pre-existing .envrc files, expect a wall of
+#   direnv: skipping ancestor: ~/foo (run: direnv allow ~/foo)
+# lines for each ancestor not yet in direnv's allow database. The hint IS
+# the resolution — run the printed `direnv allow` for each one you trust.
+
+# --- preconditions ----------------------------------------------------------
+
+# bash 3.2+ (macOS system bash). No bash-4 features (mapfile, ${var,,}, etc).
+[[ -n ${BASH_VERSION:-} ]] || {
+    printf 'direnvrc: requires bash, found %s\n' "${SHELL:-?}" >&2
+    # shellcheck disable=SC2317  # one of return/exit fires depending on sourced vs executed
+    return 1 2>/dev/null || exit 1
+}
+
+
+# --- portability shims ------------------------------------------------------
+
+# sha256 of stdin -> hex digest on stdout. GNU coreutils (sha256sum) and
+# BSD/macOS (shasum) both ship by default on supported platforms.
+_direnv_recursive_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    else
+        printf 'direnvrc: no sha256sum or shasum on PATH\n' >&2
+        return 127
+    fi
+}
+
+# Routine status messages — suppressed by DIRENV_RECURSIVE_QUIET. Used
+# for "loading ancestor" / "skipping ancestor" lines that an operator
+# may want to silence after onboarding.
+_direnv_recursive_log_status() {
+    [[ -n ${DIRENV_RECURSIVE_QUIET:-} ]] && return 0
+    if declare -F log_status >/dev/null 2>&1; then
+        log_status "$@"
+    else
+        printf 'direnv: %s\n' "$*" >&2
+    fi
+}
+
+# Operational diagnostics — always emitted, even with QUIET set. Used
+# for warnings about misconfiguration, parse weirdness, missing tools.
+# An operator who quieted routine noise still needs to see these.
+_direnv_recursive_log_warn() {
+    if declare -F log_error >/dev/null 2>&1; then
+        log_error "$@"
+    else
+        printf 'direnv: %s\n' "$*" >&2
+    fi
+}
+
+# --- direnv data/config locations -------------------------------------------
+
+_direnv_recursive_data_dir() {
+    printf '%s/direnv' "${XDG_DATA_HOME:-$HOME/.local/share}"
+}
+
+_direnv_recursive_config_dir() {
+    printf '%s/direnv' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+# --- security checks (mirror direnv's Allowed()) ----------------------------
+
+# direnv hashes filepath.Abs(path) — i.e. Clean(path), prefixed with PWD
+# if relative. Mirror Go's filepath.Clean semantics: PWD-prefix relative
+# paths, collapse //, drop "." segments, resolve ".." segments (popping
+# the last clean segment), and drop the trailing /. Returns "/" for an
+# empty result (rooted paths can't reduce below /).
+_direnv_recursive_abs() {
+    local p=$1
+    case $p in
+        /*) ;;
+        *)  p=$PWD/$p ;;
+    esac
+    local -a parts out=()
+    local seg
+    IFS=/ read -ra parts <<< "$p"
+    for seg in "${parts[@]}"; do
+        case $seg in
+            ''|.) ;;
+            ..)   (( ${#out[@]} > 0 )) && unset 'out[${#out[@]}-1]' ;;
+            *)    out+=("$seg") ;;
+        esac
+    done
+    if (( ${#out[@]} == 0 )); then
+        printf '/'
+    else
+        local result
+        printf -v result '/%s' "${out[@]}"
+        printf '%s' "$result"
+    fi
+}
+
+# Reject anything that isn't a 64-char lowercase hex digest. Without this,
+# a sha256 implementation that exits 0 with empty stdout would produce an
+# empty $h, and `[[ -e $datadir/allow/$h ]]` would resolve to the directory
+# itself — silently authorising every ancestor.
+_direnv_recursive_valid_digest() {
+    [[ $1 =~ ^[0-9a-f]{64}$ ]]
+}
+
+_direnv_recursive_file_hash() {
+    local p h
+    p=$(_direnv_recursive_abs "$1")
+    [[ -f $p ]] || return 1
+    h=$({ printf '%s\n' "$p"; cat -- "$p"; } | _direnv_recursive_sha256) || return 1
+    _direnv_recursive_valid_digest "$h" || return 1
+    printf '%s' "$h"
+}
+
+_direnv_recursive_path_hash() {
+    local p h
+    p=$(_direnv_recursive_abs "$1")
+    h=$(printf '%s\n' "$p" | _direnv_recursive_sha256) || return 1
+    _direnv_recursive_valid_digest "$h" || return 1
+    printf '%s' "$h"
+}
+
+_direnv_recursive_is_denied() {
+    local h
+    h=$(_direnv_recursive_path_hash "$1") || return 1
+    [[ -e "$(_direnv_recursive_data_dir)/deny/$h" ]]
+}
+
+_direnv_recursive_is_allowed_by_db() {
+    local h
+    h=$(_direnv_recursive_file_hash "$1") || return 1
+    [[ -e "$(_direnv_recursive_data_dir)/allow/$h" ]]
+}
+
+# Parse direnv.toml's [whitelist] table via Python's stdlib tomllib (3.11+).
+# Emits one "key<TAB>entry" line per whitelist entry on stdout. Returns
+# non-zero on missing file, missing python3, or any TOML parse error
+# (mirrors direnv's BurntSushi/toml refusing the whole config on syntax
+# errors — fail-closed). Tilde expansion stays in bash; this is just the
+# parse step.
+_direnv_recursive_toml_arrays() {
+    local toml=$1
+    [[ -f $toml ]] || return 1
+    command -v python3 >/dev/null 2>&1 || {
+        _direnv_recursive_log_warn "direnvrc: python3 not on PATH; cannot read direnv.toml whitelist"
+        return 1
+    }
+    python3 - "$toml" <<'PY' || return 1
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+except (OSError, tomllib.TOMLDecodeError):
+    sys.exit(1)
+wl = cfg.get("whitelist") or {}
+if not isinstance(wl, dict):
+    sys.exit(0)
+for key in ("prefix", "exact"):
+    for entry in wl.get(key, []) or []:
+        if isinstance(entry, str) and entry:
+            sys.stdout.write(f"{key}\t{entry}\n")
+PY
+}
+
+_direnv_recursive_in_toml_whitelist() {
+    local file=$1 toml key entry
+    toml="$(_direnv_recursive_config_dir)/direnv.toml"
+    [[ -f $toml ]] || return 1
+    while IFS=$'\t' read -r key entry; do
+        [[ -n $entry ]] || continue
+        # direnv (config.go:expandTildePath) rewrites a leading "~/" to
+        # $HOME for both prefix and exact entries. Mirror it here so
+        # users with the documented portable form actually match.
+        # shellcheck disable=SC2088  # '~/' is a literal pattern here, not a tilde to expand
+        case $entry in '~/'*) entry=$HOME/${entry#'~/'} ;; esac
+        case $key in
+            exact)
+                # direnv.toml(1): a directory path is treated as <dir>/.envrc
+                if [[ $file == "$entry" || $file == "$entry/.envrc" ]]; then
+                    return 0
+                fi
+                ;;
+            prefix)
+                if [[ $file == "$entry"* ]]; then
+                    return 0
+                fi
+                ;;
+        esac
+    done < <(_direnv_recursive_toml_arrays "$toml")
+    return 1
+}
+
+# Mirrors RC.Allowed() in direnv: deny first, then allow-db, then toml exact,
+# then toml prefix. Returns 0 if direnv would have loaded this file.
+_direnv_recursive_authorized() {
+    local file=$1
+    _direnv_recursive_is_denied        "$file" && return 1
+    _direnv_recursive_is_allowed_by_db "$file" && return 0
+    _direnv_recursive_in_toml_whitelist "$file" && return 0
+    return 1
+}
+
+# --- walker -----------------------------------------------------------------
+
+# Emit absolute paths of ancestor .envrc files, outermost first, excluding the
+# nearest .envrc (which direnv itself will source after this direnvrc returns).
+# When direnv evaluates an .envrc at /a/b/c/.envrc, $PWD inside this file is
+# /a/b/c — so we walk from there upward.
+_direnv_recursive_walk() {
+    # DIRENV_RECURSIVE_DEPTH bounds the walk by parent count. Ship-default
+    # is OFF — users opt in by setting a positive integer in their shell rc.
+    #   unset / empty / 0  -> off (no ancestors emitted)
+    #   N (positive)       -> walk at most N parent directories above $PWD
+    #   non-numeric        -> off + warn (fail-closed)
+    local depth=${DIRENV_RECURSIVE_DEPTH:-0}
+    local max=0
+    if [[ $depth =~ ^[0-9]+$ ]]; then
+        max=$depth
+    else
+        _direnv_recursive_log_warn "DIRENV_RECURSIVE_DEPTH=$depth is not a non-negative integer; treating as 0"
+    fi
+
+    local d=$PWD parent
+    local -a chain=()
+    local steps=0
+    while :; do
+        [[ -f $d/.envrc ]] && chain=("$d/.envrc" "${chain[@]}")
+        [[ $d == / ]] && break
+        (( steps >= max )) && break
+        parent=$(dirname -- "$d")
+        [[ $parent == "$d" ]] && break  # defensive: dirname fixpoint
+        d=$parent
+        ((steps++))
+    done
+    # Drop the nearest .envrc (last after prepend) — direnv loads it
+    # natively. The walker walks up from $PWD adding each .envrc found,
+    # so the innermost in the chain is the same file direnv's
+    # FindRC/findEnvUp would pick (closest to $PWD going up). It may sit
+    # at $PWD or several levels up if $PWD has no .envrc of its own.
+    local n=${#chain[@]}
+    if (( n > 0 )); then
+        unset 'chain[n - 1]'
+    fi
+    (( ${#chain[@]} > 0 )) && printf '%s\n' "${chain[@]}"
+    return 0
+}
+
+# --- direnv stdlib fallback -------------------------------------------------
+
+# direnv loads stdlib before this file, so source_env is normally defined.
+# Provide a safe fallback so this file can be sourced standalone for testing
+# without crashing the shell on unknown command.
+if ! declare -F source_env >/dev/null 2>&1; then
+    source_env() {
+        _direnv_recursive_log_status "source_env stub used (direnv stdlib not loaded); reading $1"
+        # shellcheck disable=SC1090
+        . "$1"
+    }
+fi
+
+# Note on stdlib source_up / source_up_if_exists: we deliberately do not
+# override these. If an .envrc file in your tree calls source_up, the parent
+# may load twice — once via this walker, once via source_up's own walk. That
+# is the .envrc author's call, not ours. Most direnv idioms (export, layout_*,
+# watch_file, use_*) are idempotent under double-source; if a parent .envrc
+# isn't, dedupe in that file or remove the redundant source_up from its
+# children.
+
+# --- main -------------------------------------------------------------------
+
+_direnv_recursive_load() {
+    local file pretty hint
+    while IFS= read -r file; do
+        [[ -n $file ]] || continue
+        pretty=${file/#"$HOME"/\~}
+        if _direnv_recursive_authorized "$file"; then
+            _direnv_recursive_log_status "loading ancestor: $pretty"
+            source_env "$file"
+        else
+            hint="run: direnv allow $(dirname -- "$file")"
+            _direnv_recursive_log_status "skipping ancestor: $pretty ($hint)"
+        fi
+    done < <(_direnv_recursive_walk)
+}
+
+# Skip auto-load when sourced as a library (test harness sets this).
+[[ -n ${DIRENV_RECURSIVE_LIB_ONLY:-} ]] || _direnv_recursive_load

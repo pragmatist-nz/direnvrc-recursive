@@ -1,0 +1,8 @@
+# Test-time toolchain. Drives CI (jdx/mise-action reads this) and gives
+# developers auto-activation of the tools `just lint` / `just test` need.
+
+[tools]
+just = "latest"
+shellcheck = "latest"
+"aqua:bats-core/bats-core" = "latest"
+python = "latest"
